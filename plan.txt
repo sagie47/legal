@@ -1,0 +1,1042 @@
+Alright — here’s a comprehensive refactor spec focused on fully supporting Work Permit → Inside Canada → Extend (with maintained status + restoration logic), while setting you up cleanly for future family graphs and other permit types.
+
+I’m going to assume:
+
+You stay on Postgres/Supabase + Drizzle
+
+You want a rules-driven checklist (“slots”)
+
+You want deterministic logic + auditability
+
+0) Goals for this slice
+Must support (v1)
+
+Create a WORK_PERMIT application with:
+
+processing_context = INSIDE_CANADA
+
+action_intent = EXTEND (and optionally RESTORE as a branch)
+
+program_type = IMP|TFWP, authorization_model = EMPLOYER_SPECIFIC|OPEN, sub_type_code
+
+Generate a slot checklist from those dimensions
+
+Track temporal logic:
+
+current status expiry date
+
+submission date
+
+maintained status eligibility
+
+restoration window (if you implement it)
+
+Document upload → link to slots → review/verify
+
+A single evaluateApplication(appId) that outputs:
+
+blockers/warnings
+
+deadlines
+
+derived flags
+
+required slots (and their state)
+
+Not required (yet)
+
+Submitting to IRCC portal automatically
+
+Perfect legal completeness across all edge-cases
+
+Full family graph (we’ll lay foundation)
+
+1) Fix your “application type” abstraction
+
+Right now: applications.type = "IMM1295, etc."
+For this platform: form codes are outputs, not types.
+
+Add enums
+app_type: WORK_PERMIT | STUDY_PERMIT | VISITOR | PR_SPOUSAL | EE_PROFILE | EE_EAPR | ...
+processing_context: OUTSIDE_CANADA | INSIDE_CANADA | PORT_OF_ENTRY
+action_intent: INITIAL | EXTEND | CHANGE_EMPLOYER | CHANGE_CONDITIONS | RESTORE
+program_type: TFWP | IMP
+authorization_model: EMPLOYER_SPECIFIC | OPEN
+
+Add these columns to applications
+
+appType (enum) NOT NULL
+
+processingContext (enum) NOT NULL
+
+actionIntent (enum) NOT NULL
+
+programType (enum, nullable at first)
+
+authorizationModel (enum, nullable at first)
+
+subTypeCode (text, nullable)
+
+submittedAt (timestamp nullable)
+
+decisionAt (timestamp nullable)
+
+Keep your existing details/applicantSnapshot/jobSnapshot for now.
+
+2) Add the missing backbone tables (this is the real refactor)
+2.1 Persons + participants (minimal, future-proof)
+
+You can limp along with applicants JSON, but WP extensions immediately benefit from first-class “person status” timelines.
+
+persons
+
+id, orgId
+
+identity jsonb (same shape as applicants.identity)
+
+timestamps
+
+application_participants
+
+applicationId, personId
+
+role: PRINCIPAL | SPOUSE | CHILD | SPONSOR
+
+unique (applicationId, personId, role) or (applicationId, personId) with role column
+
+Migration: create 1 person per applicant, link it as PRINCIPAL for all existing applications.
+
+2.2 Status timeline (required for maintained status)
+person_statuses
+
+This is the table that makes “maintained status” and “extend vs restore” deterministic.
+
+Columns:
+
+id, orgId, personId
+
+statusType: WORK_PERMIT | STUDY_PERMIT | VISITOR | TRP | PR (enum or text)
+
+validFrom (date/timestamp)
+
+validTo (date/timestamp) THIS is the key
+
+documentFileId (nullable)
+
+isCurrent boolean (or compute current via validTo)
+
+meta jsonb (permit number, conditions, notes)
+
+indexes: (personId, statusType, validTo desc)
+
+For WP extension: you must have a current status row with validTo (expiry date).
+
+2.3 Events (required for lockpoints + audit + deadlines)
+case_events
+
+Append-only. Never update events.
+
+Columns:
+
+id, orgId
+
+applicationId nullable (some events might be person-only later)
+
+personId nullable
+
+type text (start as text; enum later)
+
+occurredAt timestamp
+
+actorUserId nullable
+
+payload jsonb
+
+Events you need for this slice:
+
+APPLICATION_CREATED
+
+STATUS_EXPIRY_SET
+
+APPLICATION_SUBMITTED
+
+MAINTAINED_STATUS_ELIGIBLE (computed event optional)
+
+RESTORATION_REQUIRED (computed event optional)
+
+SLOT_VERIFIED, SLOT_REJECTED
+
+2.4 Slots (stop using documents as slot state)
+slot_definitions
+
+Template library keyed by the 5D app dimensions.
+
+Columns:
+
+id text (stable key like wp.passport.biopage)
+
+appType
+
+processingContext
+
+actionIntent
+
+programType (nullable = applies to both)
+
+authorizationModel (nullable)
+
+subTypeCode (nullable)
+
+scope: PRINCIPAL | SPOUSE | EMPLOYER | APPLICATION
+
+isRequired boolean
+
+validators jsonb (expiry rules, file types)
+
+helpText text
+
+order integer
+
+slots (instance per application)
+
+Columns:
+
+id uuid
+
+orgId
+
+applicationId
+
+personId nullable (for scoped slots)
+
+slotDefinitionId (FK to slot_definitions.id)
+
+state: missing | uploaded | in_review | verified | rejected | expired
+
+required boolean (copy from definition but overrideable)
+
+dueAt timestamp nullable
+
+meta jsonb (rejectionReason etc.)
+
+unique index (orgId, applicationId, personId, slotDefinitionId)
+
+Now “missing slot” exists as a row with state=missing.
+
+2.5 Document reuse (split into files + links)
+
+Your current documents table prevents reuse and conflates responsibilities.
+
+document_files (immutable)
+
+id, orgId
+
+storagePath, fileName, fileSize, mimeType
+
+sha256 (optional but recommended)
+
+uploadedBy
+
+timestamps
+
+metadata jsonb (original source, etc.)
+
+document_links (relationships)
+
+id, orgId
+
+documentFileId
+
+applicationId
+
+slotId (FK to slots.id OR slotDefinitionId; I recommend linking to slots.id)
+
+personId nullable
+
+status text (active, superseded) + active boolean
+
+timestamps
+
+unique constraint: one active file per slot:
+
+(orgId, slotId) WHERE active=true
+
+Migration: each existing documents row becomes:
+
+one document_file
+
+one document_link tied to the new slot record
+
+3) Work Permit “extend inside Canada” domain model (the bits you’ll actually use)
+3.1 Work permit attributes (don’t hide in JSON)
+
+Add a work_permit_attributes table keyed 1:1 with applications.id:
+
+Columns:
+
+applicationId (PK, FK)
+
+programType (TFWP/IMP) (can mirror applications columns)
+
+authorizationModel (EMPLOYER_SPECIFIC/OPEN)
+
+subTypeCode (IMP_ICT, OWP_BOWP, etc.)
+
+actionIntent (EXTEND/CHANGE_EMPLOYER/RESTORE)
+
+requestedValidTo (date)
+
+currentEmployerId nullable
+
+position jsonb (noc/teer/title/wage/location) (or normalize later)
+
+authorizationArtifact jsonb:
+
+{ kind: "LMIA"|"EMPLOYER_PORTAL_OFFER", refNumber, exemptionCode, expiresAt, complianceFeePaid }
+
+insideCanadaContext jsonb:
+
+{ currentStatusType, currentStatusExpiresAt, lastEntryDate }
+
+Rule of thumb: if it drives a checklist decision, it should not be buried in an unstructured blob.
+
+4) The Rules Engine contract (the core implementation spec)
+4.1 evaluateApplication(appId) must be pure and deterministic
+
+It loads:
+
+application + attributes
+
+principal person + current status
+
+slot instances + linked docs
+
+submission timestamp + events
+
+It returns:
+
+{
+  derived: {
+    statusExpiryAt: string | null,
+    isEligibleForMaintainedStatus: boolean,
+    restorationRequired: boolean,
+    restorationDeadlineAt: string | null,
+    recommendedSubmitBy: string | null
+  },
+  deadlines: Array<{ key: string; dueAt: string; severity: "info"|"warning"|"critical" }>,
+  blockers: Array<{ code: string; message: string; slotId?: string }>,
+  warnings: Array<{ code: string; message: string; slotId?: string }>,
+  slotPlan: Array<{ slotDefinitionId: string; scope: "PRINCIPAL"|"APPLICATION"; required: boolean }>
+}
+
+4.2 Temporal logic (this is your maintained status implementation)
+
+Inputs:
+
+currentStatus.validTo (from person_statuses)
+
+applications.submittedAt (or event APPLICATION_SUBMITTED)
+
+Rules:
+
+If submittedAt exists:
+
+if submittedAt <= statusExpiryAt ⇒ isEligibleForMaintainedStatus = true
+
+else ⇒ restorationRequired = true (and compute restoration window if you support it)
+
+If submittedAt missing:
+
+set deadline: “Submit before {statusExpiryAt} to preserve status”
+
+warnings at T-30, T-14, T-7 days
+
+If statusExpiryAt missing ⇒ blocker: “Current status expiry date required.”
+
+5) Slot definitions for WP INSIDE_CANADA + EXTEND (baseline)
+
+Below is a practical, comprehensive baseline you can start with. You’ll tailor per subtype, but this covers most firm workflows.
+
+APPLICATION-scoped (always)
+
+wp.extend.inside.form_data (the structured form dataset exists)
+
+wp.extend.inside.client_consent (optional)
+
+wp.extend.inside.rep_form_5476 (if representative is assigned)
+
+wp.extend.inside.fee_receipt (if you track payment artifacts)
+
+PRINCIPAL-scoped (always)
+
+wp.passport.biopage
+
+wp.current_status.current_work_permit (upload current permit)
+
+wp.photo.digital (if required by your chosen flow)
+
+wp.residency.proof_in_canada (optional but common: entry stamp, lease, etc.)
+
+wp.employment.current_paystubs (common evidence)
+
+wp.employment.employment_letter (common evidence)
+
+EMPLOYER_SPECIFIC branch
+
+If authorizationModel=EMPLOYER_SPECIFIC:
+
+TFWP
+
+wp.lmia.decision_letter (or LMIA ref)
+
+wp.job_offer.contract
+
+wp.employer.business_docs (optional depending your audience)
+
+wp.position.details (structured fields must be present)
+
+IMP
+
+wp.employer_portal.offer_number (structured field OR evidence)
+
+wp.exemption.code (structured)
+
+wp.job_offer.contract
+
+wp.position.details
+
+OPEN branch
+
+If authorizationModel=OPEN:
+
+wp.open.basis (structured: PGWP/BOWP/spousal/etc.)
+
+wp.open.eligibility_evidence (bundle slot; documents vary by basis)
+
+e.g., for spousal OWP: relationship proof + spouse status proof
+
+for BOWP: PR application status proof, etc.
+
+You can implement open permits “basis packs” as sub-slot templates later.
+
+6) API surface (minimal but complete)
+Application lifecycle
+
+POST /api/apps create application (with typed dimensions)
+
+GET /api/apps/:id fetch + latest evaluation
+
+POST /api/apps/:id/submit sets submittedAt, emits event, re-evaluates
+
+Work permit attributes
+
+PUT /api/apps/:id/work-permit-attrs (programType/authModel/subtype/intent etc.)
+
+Slots
+
+POST /api/apps/:id/slots/regenerate (idempotent)
+
+PATCH /api/slots/:slotId update state (review/verify/reject), set meta
+
+Documents
+
+POST /api/files/upload-url (signed URL)
+
+POST /api/files/commit creates document_files
+
+POST /api/slots/:slotId/attach-file creates document_links and sets slot state to uploaded
+
+POST /api/document-links/:id/deactivate (supersede old link)
+
+Evaluation
+
+POST /api/apps/:id/evaluate (runs evaluateApplication, persists snapshot)
+
+7) UI changes (so frontend stays dumb)
+
+For WP INSIDE + EXTEND, your UI should be driven almost entirely by the evaluation snapshot:
+
+Page layout
+
+Status card: current status expiry, submission state, “maintained eligible?” flag
+
+Deadlines: T-30/T-14/T-7 banners
+
+Checklist: slots grouped by scope (Principal / Employer / Application)
+
+Blockers: list with deep links to missing slots/fields
+
+Review mode: verify/reject slots
+
+Frontend should not “know” maintained status logic. It only renders evaluation.
+
+8) Migration plan (from your current schema)
+Step 1: Add new columns + new tables (non-breaking)
+
+add typed columns to applications
+
+create persons, application_participants
+
+create person_statuses
+
+create case_events
+
+create slot_definitions, slots
+
+create document_files, document_links
+
+Step 2: Backfill
+
+for each applicant → create person
+
+for each application → create participant PRINCIPAL
+
+for each documents row:
+
+create slot instance if missing
+
+create document_file + document_link
+
+set slot state = uploaded/verified based on old documents.status
+
+Step 3: Flip code paths
+
+new uploads go to document_files + document_links
+
+checklist uses slots, not documents
+
+Step 4: Deprecate old documents table later
+
+(keep it until stable)
+
+here’s a comprehensive refactor spec that will let you implement Work Permit → Inside Canada → Extend fully for all three branches:
+
+IMP employer-specific (LMIA-exempt)
+
+TFWP employer-specific (LMIA-based)
+
+Open work permits (e.g., PGWP, BOWP, spouse OWPs, protected person, etc.)
+
+This is designed for Postgres/Supabase + Drizzle, with a rules-driven checklist (“slots”), temporal logic (expiry/deadlines/maintained status), document reuse, and auditability.
+
+1) Core principle changes
+Stop using applications.type as the “type”
+
+Right now you’re storing something like IMM5710 in applications.type. That’s a form code, not an application type.
+
+For “WP Inside Canada Extend”, IRCC uses IMM 5710 as the core form for extending/changing conditions inside Canada. 
+Canada
+
+So: treat IMM 5710 as an output mapping, not as the app identity.
+
+Introduce typed axes (rule hooks)
+
+Add these to applications:
+
+appType = WORK_PERMIT
+
+processingContext = INSIDE_CANADA
+
+actionIntent = EXTEND | RESTORE | CHANGE_EMPLOYER | CHANGE_CONDITIONS
+
+programType = IMP | TFWP
+
+authorizationModel = EMPLOYER_SPECIFIC | OPEN
+
+subTypeCode (e.g., IMP_ICT, TFWP_LMIA_HIGH_WAGE, OWP_PGWP, OWP_BOWP, OWP_SPOUSE_OF_WORKER, …)
+
+These 6 fields are your rules-engine primary key.
+
+2) Database refactor (tables + constraints)
+
+You can keep organizations/users/employers/cohorts as-is. The refactor focuses on “case graph, slots, documents, time”.
+
+2.1 Persons + participants (foundation for all three)
+
+Your applicants JSON blobs are OK as storage, but they’re not enough for “status timelines + spouse OWP + future family”.
+
+Add:
+
+persons
+
+id, orgId
+
+identity jsonb (same shape you already use)
+
+timestamps
+
+application_participants
+
+applicationId, personId
+
+role: PRINCIPAL | SPOUSE | CHILD | SPONSOR
+
+unique (applicationId, personId, role) or (applicationId, personId) + role column
+
+Migration: 1 person per existing applicant, link them as PRINCIPAL.
+
+2.2 Status timeline (this is how you implement maintained status)
+
+Add person_statuses (append/replace as permits change):
+
+id, orgId, personId
+
+statusType: WORK_PERMIT | STUDY_PERMIT | VISITOR | TRP | PR (enum or text)
+
+validFrom, validTo (expiry date is the key)
+
+conditions jsonb (employer-specific? employer name? occupation restrictions? etc.)
+
+sourceDocumentFileId nullable
+
+timestamps
+
+index (personId, statusType, validTo desc)
+
+This lets you compute:
+
+“Does the person have valid status right now?”
+
+“When does it expire?”
+
+“Which conditions apply while on maintained status?”
+
+IRCC’s maintained status guidance for work permits is essentially: if you apply before expiry, you can keep working under the same conditions until decision. 
+IRCC Canada
++1
+
+2.3 Event log (append-only, makes temporal logic real)
+
+Add case_events:
+
+id, orgId
+
+applicationId nullable
+
+personId nullable
+
+type text (enum later)
+
+occurredAt timestamp
+
+actorUserId nullable
+
+payload jsonb
+
+index (applicationId, occurredAt desc)
+
+Events you’ll use in this slice:
+
+APPLICATION_CREATED
+
+STATUS_EXPIRY_SET (or just read from person_statuses)
+
+APPLICATION_SUBMITTED
+
+SLOT_VERIFIED, SLOT_REJECTED
+
+DECISION_APPROVED, DECISION_REFUSED
+
+2.4 Slot model (stop using documents rows as “slot state”)
+
+You need to represent missing requirements even when no document exists yet.
+
+Add:
+
+slot_definitions (templates)
+
+id (stable key like wp.passport.biopage)
+
+match keys: appType, processingContext, actionIntent
+
+optional constraints: programType?, authorizationModel?, subTypeCode? (nullable = wildcard)
+
+scope: PRINCIPAL | SPOUSE | EMPLOYER | APPLICATION
+
+required boolean
+
+validators jsonb (filetype rules, expiry rules, structured-field requirements)
+
+order int, helpText
+
+slots (instances per application)
+
+id uuid
+
+orgId, applicationId
+
+personId nullable (for scoped slots)
+
+slotDefinitionId
+
+state: missing | uploaded | in_review | verified | rejected | expired
+
+required (copied from definition but overrideable)
+
+meta jsonb (rejection reason, notes)
+
+unique (orgId, applicationId, personId, slotDefinitionId)
+
+2.5 Documents: split file storage from linking (enables reuse)
+
+Refactor documents into:
+
+document_files (immutable)
+
+file metadata + storagePath (+ optional sha256)
+
+uploadedBy, timestamps
+
+document_links (relationships)
+
+link file → slot (+ person/application context)
+
+active boolean so replacements supersede older files
+
+unique constraint: one active link per slot
+
+(orgId, slotId) WHERE active=true
+
+This unlocks:
+
+“reuse passport across apps”
+
+“link existing”
+
+“replace doc without losing audit trail”
+
+2.6 Work permit-specific attributes (don’t bury rule drivers in JSON)
+
+Add 1:1 table:
+
+work_permit_cases
+
+applicationId PK/FK
+
+programType (IMP/TFWP)
+
+authorizationModel (EMPLOYER_SPECIFIC/OPEN)
+
+subTypeCode
+
+actionIntent (EXTEND/RESTORE/CHANGE_…)
+
+requestedValidTo date
+
+currentStatusExpiresAt date (can be derived from person_statuses, but caching is ok)
+
+employerId nullable
+
+position jsonb (noc/teer/title/wage/location)
+
+authorizationArtifact jsonb:
+
+{ kind: "LMIA" | "EMPLOYER_PORTAL_OFFER", refNumber, exemptionCode, expiresAt, complianceFeePaid }
+
+openBasis jsonb:
+
+{ basisCode: "PGWP"|"BOWP"|"SPOUSE_OF_WORKER"|..., policyPack: "2025-01-21" }
+
+Why: IRCC’s extension prerequisites differ depending on LMIA vs LMIA-exempt; for example employers may need a new LMIA (TFWP) or a new offer of employment + compliance fee (LMIA-exempt/IMP) before the worker applies. 
+Canada
++1
+
+3) Rules engine spec (the single function that runs everything)
+3.1 Contract
+
+Implement:
+
+evaluateApplication(appId) -> Evaluation
+
+Return:
+
+type Evaluation = {
+  derived: {
+    statusExpiryAt: string | null
+    recommendedApplyBy: string | null   // statusExpiryAt - 30d
+    isMaintainedStatusEligible: boolean
+    maintainedStatusConditions: "SAME_AS_CURRENT" | "NONE"
+    restorationLikelyRequired: boolean
+  }
+  deadlines: { key: string; dueAt: string; severity: "info"|"warning"|"critical" }[]
+  blockers: { code: string; message: string; slotDefinitionId?: string }[]
+  warnings: { code: string; message: string; slotDefinitionId?: string }[]
+  slotPlan: { slotDefinitionId: string; required: boolean; scope: string; personId?: string }[]
+}
+
+
+Persist the output in application_evaluations (cached snapshot) so the UI renders fast.
+
+3.2 Temporal logic (Inside Canada Extend)
+
+Determine statusExpiryAt from person_statuses for PRINCIPAL (current WP status).
+
+Recommend applying 30 days before expiry as a warning threshold (not a blocker). 
+Canada
++1
+
+If submitted (APPLICATION_SUBMITTED event or submittedAt):
+
+if submittedAt <= statusExpiryAt ⇒ isMaintainedStatusEligible = true
+
+else ⇒ restoration path / warning or blocker depending on your policy pack
+
+Maintained status condition mirror:
+
+while waiting, user continues under same conditions as original permit (especially important for employer-specific permits). 
+IRCC Canada
++1
+
+Edge case: IRCC notes some scenarios don’t benefit from maintained status (e.g., certain TRP applicants). Model this as a rule keyed off statusType. 
+Canada
+
+4) Slot definitions: seed set for all three branches
+
+Naming convention:
+
+wp.<scope>.<topic>.<detail>
+
+Keep IDs stable forever.
+
+4.1 Common slots (all WP INSIDE + EXTEND)
+
+APPLICATION scope
+
+wp.inside.extend.form_payload (structured data present)
+
+wp.inside.extend.letter_of_explanation (often optional, but useful)
+
+wp.inside.extend.fee_payment_proof (optional depending on implementation)
+
+wp.inside.extend.rep_authorization (only if rep assigned)
+
+PRINCIPAL scope
+
+wp.passport.biopage
+
+wp.current_permit.copy
+
+wp.status.proof_in_canada (optional, but common)
+
+wp.photo.digital (optional if you require)
+
+wp.employment.current_paystubs (recommended evidence)
+
+wp.employment.employment_letter (recommended evidence)
+
+Validators examples:
+
+passport expiry must be after requested validity (warning/blocker)
+
+current permit must exist (blocker)
+
+structured fields must be present (currentStatusExpiresAt, etc.)
+
+4.2 Employer-specific IMP (LMIA-exempt)
+
+Add slots keyed by: programType=IMP, authorizationModel=EMPLOYER_SPECIFIC
+
+EMPLOYER scope
+
+wp.imp.employer_portal.offer_number (structured field + evidence)
+
+wp.imp.employer_portal.compliance_fee_receipt (evidence)
+
+wp.imp.exemption_code (structured field)
+
+wp.job_offer.offer_letter_or_contract
+
+PRINCIPAL scope
+
+wp.position.details (structured required: NOC/TEER/title/wage/location)
+
+Why: Employer Portal is specifically tied to IMP / LMIA-exempt offers. 
+Canada
++1
+
+And extension workflows often require a new offer submission and compliance fee for LMIA-exempt situations. 
+Canada
+
+4.3 Employer-specific TFWP (LMIA-based)
+
+Add slots keyed by: programType=TFWP, authorizationModel=EMPLOYER_SPECIFIC
+
+EMPLOYER scope
+
+wp.tfw.lmia.decision_letter_or_number
+
+wp.tfw.lmia.validity_window (validator: expiresAt after submit)
+
+wp.job_offer.offer_letter_or_contract
+
+PRINCIPAL scope
+
+wp.position.details (structured required)
+
+Rule hook: IRCC states that for LMIA-required extension paths, a new LMIA is needed before extension submission. 
+Canada
+
+4.4 Open work permits (inside Canada extend)
+
+Add slots keyed by: authorizationModel=OPEN
+
+APPLICATION scope
+
+wp.open.basis_code (structured: PGWP/BOWP/SPOUSE/PROTECTED_PERSON/etc.)
+
+wp.open.eligibility_bundle (bundle slot; actual evidence varies)
+
+Then have basis-specific mini packs (subTypeCode or basisCode):
+
+PGWP:
+
+wp.open.pgwp.program_completion_proof (if relevant)
+
+wp.open.pgwp.passport_validity_note (validator; often reason for partial validity)
+
+BOWP:
+
+wp.open.bowp.pr_application_proof (AOR-like proof)
+
+Spouse open work permit:
+
+wp.open.spouse.relationship_proof
+
+wp.open.spouse.principal_status_proof
+
+wp.open.spouse.principal_employment_proof
+
+plus policyPack selector: IRCC changed eligibility for family OWPs effective Jan 21, 2025. 
+Canada
++1
+
+You should enforce this via effective-dated policy packs, not hardcoded thresholds.
+
+5) Slot generation algorithm (deterministic, idempotent)
+
+When app is created or dimensions change:
+
+regenerateSlots(appId):
+
+Load app dimensions + participants
+
+Query slot_definitions where:
+
+required keys match exactly, AND
+
+optional keys are either NULL (wildcard) or equal to app value
+
+Upsert slots for each definition (don’t delete old; mark obsolete if needed)
+
+Return current slot list (grouped)
+
+This allows you to update your definition library without data loss.
+
+6) API spec (minimal but complete for v1)
+Create and configure
+
+POST /api/apps → creates app + emits APPLICATION_CREATED
+
+PUT /api/apps/:id/work-permit → set WP dimensions + attributes
+
+POST /api/apps/:id/slots/regenerate
+
+Status timeline
+
+POST /api/persons/:id/statuses → add/update current status record
+
+(or PUT /api/apps/:id/current-status to keep UI simple)
+
+Documents
+
+POST /api/files/upload-url
+
+POST /api/files/commit → creates document_files
+
+POST /api/slots/:slotId/attach → creates document_links(active=true), marks slot uploaded
+
+POST /api/document-links/:id/supersede → sets old inactive
+
+Review workflow
+
+POST /api/slots/:slotId/verify (+ event)
+
+POST /api/slots/:slotId/reject (+ reason, event)
+
+Evaluation
+
+POST /api/apps/:id/evaluate → runs evaluateApplication, persists snapshot
+
+POST /api/apps/:id/submit → sets submittedAt + emits APPLICATION_SUBMITTED + re-evaluates
+
+7) UI spec for this slice (frontend stays dumb)
+
+One page: Work Permit Extension (Inside Canada)
+
+Status bar
+
+Current status expiry date
+
+“Apply by” recommendation (expiry − 30 days) 
+Canada
++1
+
+Maintained status eligibility indicator (based on submission timing) 
+IRCC Canada
++1
+
+Blockers / warnings
+
+Missing expiry date
+
+Missing core artifacts (LMIA or Employer Portal offer)
+
+Missing required slots
+
+Checklist
+Grouped:
+
+Principal
+
+Employer
+
+Application
+
+Submit readiness
+
+“Ready to submit” when blockers are zero
+
+On submit: lock some fields (or force change log)
+
+8) Migration plan from your current schema (safe + incremental)
+
+Add new columns to applications (keep old type untouched)
+
+Create new tables: persons/participants/statuses/events/slots/files/links/evaluations
+
+Backfill:
+
+applicants → persons
+
+applications → participants(PRINCIPAL)
+
+documents → document_files + document_links + slots
+
+Flip new uploads to go through document_files + document_links
+
+Later: deprecate old documents table
+
+9) “All three” nuance you must encode (so you don’t paint yourself into a corner)
+Policy packs (effective-dated)
+
+Open work permits (especially spouse OWPs) change. IRCC explicitly changed family OWP eligibility effective Jan 21, 2025. 
+Canada
++1
+
+So implement:
+
+policy_packs table (key, effective_from, rules_json)
+
+choose pack by submissionAt ?? now()
+
+No hardcoded thresholds in your DB schema.

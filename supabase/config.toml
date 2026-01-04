@@ -1,0 +1,7 @@
+project_id = "yrohswgyceedbarsxtxl"
+
+[functions.upload-document]
+verify_jwt = true
+
+[functions.ensure-user]
+verify_jwt = true

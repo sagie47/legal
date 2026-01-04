@@ -1,0 +1,52 @@
+{
+  "application_type": "Work Permit Outside Canada",
+  "groups": [
+    {
+      "id": "identity",
+      "title": "Identity & Status",
+      "slots": [
+        {
+          "id": "passport_applicant",
+          "label": "Passport - Applicant",
+          "role": "applicant",
+          "document_type": "passport",
+          "required": true,
+          "condition": null,
+          "lock_message": null
+        },
+        {
+          "id": "status_doc",
+          "label": "Current Status Document (if in Canada)",
+          "role": "applicant",
+          "document_type": "status_doc",
+          "required": true,
+          "condition": {
+            "field": "statusInCanada.isInCanada",
+            "operator": "eq",
+            "value": true
+          },
+          "lock_message": "This becomes required once you mark the applicant as currently in Canada in the Status tab."
+        }
+      ]
+    },
+    {
+      "id": "family",
+      "title": "Family",
+      "slots": [
+        {
+          "id": "marriage_certificate",
+          "label": "Marriage Certificate (if married/common-law)",
+          "role": "spouse",
+          "document_type": "marriage_certificate",
+          "required": true,
+          "condition": {
+            "field": "family.spouseExists",
+            "operator": "eq",
+            "value": true
+          },
+          "lock_message": "Add spouse details in the Family tab to unlock this."
+        }
+      ]
+    }
+  ]
+}
