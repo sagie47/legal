@@ -352,7 +352,7 @@ serve(async (req) => {
         }));
 
         // =========================================================================
-        // 8. Fetch Pending Proposals
+        // 8. Fetch Pending Proposals (filtered to exclude retired slots)
         // =========================================================================
         const { data: proposalsData } = await supabase
             .from("fact_proposals")
@@ -371,17 +371,23 @@ serve(async (req) => {
             .eq("application_id", applicationId)
             .in("status", ["pending"]);
 
-        const pendingProposals = (proposalsData || []).map((p: any) => ({
-            id: p.id,
-            fieldKey: p.field_key,
-            targetEntityType: p.target_entity_type,
-            proposedValue: p.proposed_value_json,
-            currentValue: p.current_value_json,
-            confidence: parseFloat(p.confidence),
-            severity: p.severity,
-            sourceAnchor: p.source_anchor,
-            sourceSlotId: p.source_slot_id,
-        }));
+        // Build a Set of active slot IDs for fast lookup
+        const activeSlotIdSet = new Set(slotIds);
+
+        // Filter out proposals from retired slots (slots that no longer exist for this application)
+        const pendingProposals = (proposalsData || [])
+            .filter((p: any) => !p.source_slot_id || activeSlotIdSet.has(p.source_slot_id))
+            .map((p: any) => ({
+                id: p.id,
+                fieldKey: p.field_key,
+                targetEntityType: p.target_entity_type,
+                proposedValue: p.proposed_value_json,
+                currentValue: p.current_value_json,
+                confidence: parseFloat(p.confidence),
+                severity: p.severity,
+                sourceAnchor: p.source_anchor,
+                sourceSlotId: p.source_slot_id,
+            }));
 
         // =========================================================================
         // 9. Build Response

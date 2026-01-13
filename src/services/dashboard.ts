@@ -38,23 +38,36 @@ export async function getActiveCohorts(orgId: string) {
 
     if (error) throw error;
 
-    // Need to map snake_case from DB to camelCase if UI expects it?
-    // Our Drizzle schema used camelCase in TS but DB columns are snake_case.
-    // The UI currently expects: `name`, `workers` (string), `lmia` (status), `risk`, `next`.
-    // We need to transform the data to match UI expectations.
+    // Fetch application counts per cohort
+    const cohortIds = (data || []).map(c => c.id);
+    const workerCounts: Record<string, number> = {};
+
+    if (cohortIds.length > 0) {
+        const { data: applications } = await supabase
+            .from('applications')
+            .select('cohort_id')
+            .in('cohort_id', cohortIds);
+
+        // Count applications per cohort
+        for (const app of applications || []) {
+            if (app.cohort_id) {
+                workerCounts[app.cohort_id] = (workerCounts[app.cohort_id] || 0) + 1;
+            }
+        }
+    }
 
     return (data || []).map(c => ({
         id: c.id,
         name: c.name,
         locationCity: c.job_details?.locationCity,
         locationProvince: c.job_details?.locationProvince,
-        workersCurrent: 0, // TODO: fetch actual count
+        workersCurrent: workerCounts[c.id] || 0,
         jobDetails: c.job_details,
-        workers: `0/${c.job_details?.targetWorkers || 0}`,
+        workers: `${workerCounts[c.id] || 0}/${c.job_details?.targetWorkers || 0}`,
         status: c.status,
-        lmia: capitalize(c.status), // map status to UI label
+        lmia: capitalize(c.status),
         riskLevel: c.risk_level,
-        wp: 'Not Started', // placeholder
+        wp: 'Not Started',
         next: 'View Details'
     }));
 }

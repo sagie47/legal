@@ -167,10 +167,10 @@ export async function evaluateApplication(appId: string): Promise<Evaluation> {
         }
     }
 
-    // 4. Load slots for this application
+    // 4. Load slots for this application (join to get scope from definition)
     const { data: slots } = await supabase
         .from('slots')
-        .select('id, slot_definition_id, state, is_required, meta')
+        .select('id, slot_definition_id, state, is_required, meta, slot_definitions(scope)')
         .eq('application_id', appId);
 
     // 5. Build evaluation
@@ -540,7 +540,7 @@ export async function evaluateApplication(appId: string): Promise<Evaluation> {
 
             evaluation.slotPlan.push({
                 slotDefinitionId: slot.slot_definition_id,
-                scope: 'PRINCIPAL', // TODO: get from definition
+                scope: (slot as any).slot_definitions?.scope || 'PRINCIPAL',
                 required: slot.is_required
             });
         }
@@ -600,14 +600,28 @@ export async function regenerateSlots(appId: string, orgId: string): Promise<voi
         return;
     }
 
+    // 2b. Get principal person ID for scoped slots
+    const { data: principalParticipant } = await supabase
+        .from('application_participants')
+        .select('person_id')
+        .eq('application_id', appId)
+        .eq('role', 'PRINCIPAL')
+        .single();
+    const principalPersonId = principalParticipant?.person_id || null;
+
     // 3. Create slot instances (upsert to be idempotent)
     for (const def of definitions) {
+        // Determine person_id based on scope
+        const personId = ['PRINCIPAL', 'SPOUSE', 'DEPENDENT'].includes(def.scope)
+            ? principalPersonId
+            : null;
+
         const { error: upsertError } = await supabase
             .from('slots')
             .upsert({
                 org_id: orgId,
                 application_id: appId,
-                person_id: null, // TODO: Get principal person ID for scoped slots
+                person_id: personId,
                 slot_definition_id: def.id,
                 state: 'missing',
                 is_required: def.is_required,
